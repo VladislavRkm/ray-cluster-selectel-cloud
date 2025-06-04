@@ -1,0 +1,15 @@
+[Unit]
+Description=Ray Cluster Service (Worker Node)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/opt/ray/venv/bin/ray start --address={{ HEAD_NODE_IP }}:6379
+ExecStop=/opt/ray/venv/bin/ray stop
+Restart=on-failure
+RestartSec=5
+Environment="PYTHONUNBUFFERED=1"
+
+[Install]
+WantedBy=multi-user.target

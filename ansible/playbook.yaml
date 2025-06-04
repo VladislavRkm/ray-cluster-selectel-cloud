@@ -1,0 +1,164 @@
+---
+- name: Deploy Ray cluster with Data and Train components
+  hosts: all
+  become: yes
+  vars:
+    ray_version: "2.10.0"
+    python_version: "3.11"
+    pip_timeout: 180
+    pip_retries: 3
+    torch_version: "2.3.0"
+    torchvision_version: "0.18.0"
+
+  tasks:
+    # 2. Установка системных зависимостей
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install system dependencies
+      apt:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - "python{{ python_version }}"
+        - "python{{ python_version }}-dev"
+        - "python{{ python_version }}-venv"
+        - build-essential
+        - cmake
+        - libssl-dev
+        - zlib1g-dev
+        - libffi-dev
+        - libreadline-dev
+        - libsqlite3-dev
+        - wget
+        - curl
+        - git
+        - tmux
+        - iptables
+        - iptables-persistent
+
+    # 3. Настройка Python окружения
+    - name: Create Python virtual environment
+      command: "python{{ python_version }} -m venv /opt/ray/venv"
+      args:
+        creates: /opt/ray/venv
+
+    # 4. Установка Ray и зависимостей
+    - name: Install Ray core
+      pip:
+        executable: /opt/ray/venv/bin/pip
+        name: "ray[default]=={{ ray_version }}"
+        state: present
+        extra_args: "--timeout {{ pip_timeout }} --retries {{ pip_retries }}"
+
+    - name: Fix broken fsspec installation
+      pip:
+        executable: /opt/ray/venv/bin/pip
+        name: fsspec
+        state: forcereinstall
+
+    - name: Install Ray Data components
+      pip:
+        executable: /opt/ray/venv/bin/pip
+        name:
+          - "ray[data]=={{ ray_version }}"
+          - "pandas<2.0"
+          - "numpy<2.0"
+          - "pyarrow<15.0"
+          - "fsspec"
+          - "s3fs"
+        state: present
+      ignore_errors: yes
+      retries: 2
+      delay: 10
+
+    - name: Install Ray Train components
+      pip:
+        executable: /opt/ray/venv/bin/pip
+        name:
+          - "ray[train]=={{ ray_version }}"
+          - "ray[air]=={{ ray_version }}"
+          - "ray[tune]=={{ ray_version }}"
+        state: present
+        extra_args: "--timeout {{ pip_timeout }}"
+      retries: 3
+      delay: 15
+
+    # 5. Установка PyTorch
+    - name: Install PyTorch for CPU nodes
+      pip:
+        executable: /opt/ray/venv/bin/pip
+        name:
+          - "torch=={{ torch_version }}"
+          - "torchvision=={{ torchvision_version }}"
+        extra_args: |
+          --index-url https://download.pytorch.org/whl/cpu
+          --timeout 300
+      when: "'gpu' not in group_names"
+
+    - name: Install PyTorch for GPU nodes
+      pip:
+        executable: /opt/ray/venv/bin/pip
+        name:
+          - "torch=={{ torch_version }}+cu121"
+          - "torchvision=={{ torchvision_version }}+cu121"
+        extra_args: |
+          --index-url https://download.pytorch.org/whl/cu121
+          --timeout 600
+      when: "'gpu' in group_names"
+
+    # 6. Установка дополнительных зависимостей
+    - name: Install ML dependencies
+      pip:
+        executable: /opt/ray/venv/bin/pip
+        name:
+          - "scikit-learn"
+          - "xgboost"
+          - "lightgbm"
+          - "tensorboard"
+          - "datasets"
+          - "transformers"
+        state: present
+      ignore_errors: yes
+
+    # 7. Настройка сервиса systemd
+    - name: Deploy Ray systemd service
+      template:
+        src: "ray-{{ 'head' if inventory_hostname in groups['ray_head'] else 'worker' }}.service.j2"
+        dest: /etc/systemd/system/ray.service
+        mode: 0644
+      vars:
+        HEAD_NODE_IP: "{{ groups['ray_head'][0] }}"
+      notify:
+        - daemon-reload
+        - enable-and-start-ray
+
+    - name: Configure iptables rules
+      iptables:
+        chain: INPUT
+        protocol: tcp
+        destination_port: "{{ item }}"
+        jump: ACCEPT
+        comment: "Allow Ray port {{ item }}"
+      loop:
+        - 6379   # Ray 
+        - 8265   # Dashboard
+        - 10001  # Client
+      notify: persist-iptables
+
+  handlers:
+    - name: daemon-reload
+      systemd:
+        daemon_reload: yes
+
+    - name: enable-and-start-ray
+      systemd:
+        name: ray
+        state: started
+        enabled: yes
+
+    - name: persist-iptables
+      command: netfilter-persistent save
+      when: ansible_os_family == 'Debian'
